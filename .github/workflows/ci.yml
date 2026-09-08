@@ -51,8 +51,10 @@ jobs:
           sleep 1
           python3 scripts/mcast_smoke_test.py send > send.log 2>&1 &
           SEND_PID=$!
+          set +e
           wait $RECV_PID
           RECV_STATUS=$?
+          set -e
           kill $SEND_PID 2>/dev/null || true
           echo "=== recv.log ==="; cat recv.log
           echo "=== send.log ==="; cat send.log
