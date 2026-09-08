@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "someip-sd-demo"
+name = "someip-sd-sim"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
