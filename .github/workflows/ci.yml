@@ -40,6 +40,24 @@ jobs:
         # interfaces don't need this; it's a loopback-testing-only step.
         run: sudo ip -6 route add ff00::/8 dev lo
 
+      - name: Diagnose raw cross-process IPv6 multicast on this runner
+        # Temporary diagnostic, independent of pysomeip/asyncio: confirms
+        # two separate OS processes can exchange a multicast datagram at
+        # all on this host, to isolate whether a demo failure is
+        # environmental or in our own code.
+        run: |
+          python3 scripts/mcast_smoke_test.py recv > recv.log 2>&1 &
+          RECV_PID=$!
+          sleep 1
+          python3 scripts/mcast_smoke_test.py send > send.log 2>&1 &
+          SEND_PID=$!
+          wait $RECV_PID
+          RECV_STATUS=$?
+          kill $SEND_PID 2>/dev/null || true
+          echo "=== recv.log ==="; cat recv.log
+          echo "=== send.log ==="; cat send.log
+          exit $RECV_STATUS
+
       - name: Run server and client over real IPv6 loopback
         run: |
           uv run sd-server --log-level DEBUG > server.log 2>&1 &
