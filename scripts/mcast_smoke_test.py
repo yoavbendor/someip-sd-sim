@@ -40,6 +40,11 @@ def send():
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, if_index())
     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+    # IPV6_MULTICAST_LOOP governs whether a sent datagram is delivered to
+    # ANY local group member on this interface (not just "back to the
+    # sender" despite the name) -- testing whether it defaults to off here.
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_LOOP, 1)
+    print("send: IPV6_MULTICAST_LOOP explicitly set to 1", flush=True)
     for i in range(10):
         sock.sendto(f"hello-{i}".encode(), (GROUP, PORT))
         print(f"send: sent hello-{i}", flush=True)
