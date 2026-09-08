@@ -79,6 +79,15 @@ doesn't need them:
 
 ## Running it
 
+Linux's `lo` interface gets no IPv6 multicast route (`ff00::/8`) by
+default, so any multicast `sendto()` over loopback fails with
+`ENETUNREACH` until you add one (real network interfaces don't need
+this -- it's loopback-testing-only, and it's what CI does too):
+
+```sh
+sudo ip -6 route add ff00::/8 dev lo
+```
+
 ```sh
 uv sync
 uv run sd-server        # terminal 1

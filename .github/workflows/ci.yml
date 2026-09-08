@@ -32,6 +32,14 @@ jobs:
           print('AF_INET6 loopback OK:', s.getsockname())
           "
 
+      - name: Add IPv6 multicast route for the loopback interface
+        # Linux's `lo` gets no multicast route (ff00::/8) by default, so
+        # any sendto() to a multicast address over loopback fails with
+        # ENETUNREACH regardless of IPV6_MULTICAST_IF -- discovered by
+        # this exact CI job failing on its first real run. Real network
+        # interfaces don't need this; it's a loopback-testing-only step.
+        run: sudo ip -6 route add ff00::/8 dev lo
+
       - name: Run server and client over real IPv6 loopback
         run: |
           uv run sd-server --log-level DEBUG > server.log 2>&1 &
