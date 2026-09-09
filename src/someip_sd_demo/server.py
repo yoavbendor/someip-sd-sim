@@ -17,11 +17,19 @@ import argparse
 import asyncio
 import ipaddress
 import logging
+import os
+import sys
 
 import someip.header as h
 from someip.config import Service
 from someip.header import IPv6EndpointOption, IPv6MulticastOption, L4Protocols
-from someip.sd import EventgroupSubscription, ServiceInstance, ServerServiceListener, format_address
+from someip.sd import (
+    TTL_FOREVER,
+    EventgroupSubscription,
+    ServiceInstance,
+    ServerServiceListener,
+    format_address,
+)
 
 from someip_sd_demo.common import (
     CLIENT_SD_UNICAST_PORT,
@@ -73,6 +81,29 @@ class SensorEventgroupListener(ServerServiceListener):
             format_address(source),
             self.active,
         )
+
+
+async def wait_all_subscribed(
+    listeners: dict[int, SensorEventgroupListener], timeout: float, log: logging.Logger
+) -> None:
+    """Block until every offered service has at least one active subscriber,
+    or raise TimeoutError after `timeout` seconds.
+
+    Used by --exit-after-subscribed to know when the real SD handshake
+    (Offer/Subscribe/Ack) is done and it's safe to hand off to a tcpreplay
+    of the actual captured data-plane traffic.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while True:
+        pending = [l.service.name for l in listeners.values() if l.active <= 0]
+        if not pending:
+            return
+        if loop.time() >= deadline:
+            raise TimeoutError(
+                f"timed out after {timeout}s waiting for a subscriber on: {', '.join(pending)}"
+            )
+        await asyncio.sleep(0.05)
 
 
 def build_offered_service(service: SensorService, local_addr: str, unicast_port: int) -> Service:
@@ -131,6 +162,20 @@ async def run(args: argparse.Namespace) -> None:
     timings.ANNOUNCE_TTL = 6
     timings.SUBSCRIBE_TTL = 5
 
+    if args.exit_after_subscribed:
+        # The offered-service TTL is entirely ours to set, so make the
+        # client never need a fresh Offer to keep considering the service
+        # valid once this process is gone. The eventgroup SUBSCRIBE ttl is
+        # NOT ours to set this way -- pysomeip's server-side Ack just
+        # echoes back whatever ttl the *client* requested in its own
+        # Subscribe entry (see handle_subscribe() in someip/sd.py), so a
+        # client that chose a short subscribe ttl and expects to renew it
+        # will find nobody answering after this process exits. Whether
+        # that actually drops the multicast group membership is up to
+        # that client's own implementation -- verify empirically against
+        # your real target client. See README.
+        timings.ANNOUNCE_TTL = TTL_FOREVER
+
     listeners: dict[int, SensorEventgroupListener] = {}
     instances: list[ServiceInstance] = []
     for service in SERVICES:
@@ -152,6 +197,32 @@ async def run(args: argparse.Namespace) -> None:
         )
 
     sd_prot.start()
+
+    if args.exit_after_subscribed:
+        await wait_all_subscribed(listeners, timeout=args.subscribe_timeout, log=log)
+        # Deliberately do NOT send StopOffer and do NOT go through the
+        # normal asyncio.run() shutdown path: pysomeip sends StopOffer
+        # whenever a service's offer task is cancelled (see ServiceInstance
+        # in someip/sd.py) -- including via sd_prot.stop(), and including
+        # via asyncio.run()'s own default cancel-all-remaining-tasks
+        # cleanup on the way out. Either of those would tell the client
+        # the service is gone right before we hand off to tcpreplay,
+        # defeating the whole point. A brief grace sleep lets the just-sent
+        # SubscribeAck datagrams actually leave the socket, then os._exit()
+        # terminates the process immediately, skipping all Python-level
+        # cleanup/finally blocks -- the same way a real sensor that lost
+        # power would vanish without a StopOffer, which is the behavior we
+        # want here: the client's SD state and multicast group membership
+        # stay exactly as they were, untouched by this process going away.
+        log.info(
+            "all %d service(s) have a subscriber; exiting 0 for tcpreplay handoff "
+            "(no StopOffer sent -- see README's tcpreplay-handoff section)",
+            len(SERVICES),
+        )
+        await asyncio.sleep(0.2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     if unicast_mode:
         data_sock = open_unicast_data_send_socket(args.local_addr)
@@ -231,6 +302,24 @@ def parse_args() -> argparse.Namespace:
         help="interface to join/send multicast on (default: %(default)s; e.g. eth0 in a container)",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--exit-after-subscribed",
+        action="store_true",
+        help="Exit 0 as soon as every offered service has a subscriber, instead of "
+        "streaming notifications -- for handing off to a separate tcpreplay of the "
+        "real captured multicast data once the real SD handshake (Offer/Subscribe/"
+        "Ack) has completed. Sets the offered-service TTL to 'forever' and exits "
+        "without sending StopOffer, so the client's SD state and multicast group "
+        "membership are left exactly as they were. See README's tcpreplay-handoff "
+        "section, including the eventgroup-subscribe-ttl caveat.",
+    )
+    parser.add_argument(
+        "--subscribe-timeout",
+        type=float,
+        default=30.0,
+        help="with --exit-after-subscribed: seconds to wait for every service to gain "
+        "a subscriber before giving up and exiting non-zero (default: %(default)s)",
+    )
     return parser.parse_args()
 
 
@@ -240,6 +329,9 @@ def main() -> None:
         asyncio.run(run(args))
     except KeyboardInterrupt:
         pass
+    except TimeoutError as exc:
+        logging.getLogger("demo.server").error("%s", exc)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

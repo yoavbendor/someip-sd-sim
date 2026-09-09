@@ -435,6 +435,65 @@ cmake -B /tmp/nanom/build -S /tmp/nanom && cmake --build /tmp/nanom/build --targ
 /tmp/nanom/build/nanom_shark_cli /tmp/sd_demo.pcap --json /tmp/sd_demo.ndjson
 ```
 
+## Handing off to a tcpreplay of real captured sensor data
+
+If the goal is to simulate the real sensor by tcpreplaying its actual
+captured multicast traffic (rather than this demo's synthetic
+notifications), `sd-server --exit-after-subscribed` does the real SD
+handshake (Offer/Subscribe/Ack, via pysomeip, exactly as normal) and then
+exits 0 the moment every offered service has a subscriber, instead of
+entering the notification loop:
+
+```sh
+uv run sd-server --exit-after-subscribed && \
+  tcpreplay -i eth0 captured_sensor_data.pcap
+```
+
+Why this is safe to hand off to tcpreplay: once the client's real
+SubscribeAck has been received, its multicast group membership is tracked
+by its own socket/OS (IGMP/MLD join) -- independent of whether the server
+process that sent the Ack is still running. So the server can simply
+disappear, and the client keeps listening on the same multicast group(s)
+it already joined, ready to receive tcpreplay's traffic as if the real
+server had sent it.
+
+Two things this flag does to make that safe:
+
+- **Sets the offered-service TTL to "forever"** (`someip.sd.TTL_FOREVER`),
+  so the client never needs another Offer to keep considering the service
+  valid.
+- **Exits via `os._exit()`, without sending StopOffer.** This is a
+  deliberate implementation detail, not an oversight: pysomeip sends a
+  StopOffer whenever a service's offer task is cancelled (see
+  `ServiceInstance` in `someip/sd.py`) -- including via the normal
+  `sd_prot.stop()` shutdown path, and including via `asyncio.run()`'s own
+  default "cancel every remaining task" cleanup on the way out. Either of
+  those would tell the client the service is gone right before handing off
+  to tcpreplay, defeating the whole point. `os._exit()` terminates the
+  process immediately, skipping all of that -- the same way a real sensor
+  that lost power would vanish without a StopOffer, which is exactly the
+  behavior wanted here.
+
+**Caveat -- the eventgroup *subscribe* TTL is the client's choice, not
+this server's.** The offered-service TTL above is entirely under this
+server's control, but the per-eventgroup Subscribe TTL is chosen by the
+*client* in its own Subscribe request; pysomeip's server-side Ack just
+echoes back whatever TTL the client asked for (see `handle_subscribe()` in
+`someip/sd.py`). If your target client requests a short subscribe TTL and
+expects to periodically renew it, it will find nobody answering once this
+process has exited. Whether that actually makes the client drop its
+subscription state or leave the multicast group is entirely up to that
+client's own implementation -- some stacks keep listening regardless,
+others may not. **Verify this empirically against your real target
+client** before relying on a long tcpreplay run; if it turns out to
+matter, the practical fix is on the client/network side (e.g. keep
+tcpreplay's run shorter than the client's subscribe TTL), not something
+this server can override on its own.
+
+`scripts/exit_after_subscribed_check.py` covers the wait-for-subscribers
+logic offline (no networking); `ci.yml`'s "exit-after-subscribed" step
+covers the live exit-0/no-StopOffer behavior end-to-end.
+
 ## Relationship to the C++ port
 
 This demo is deliberately throwaway/reference code: once the two
