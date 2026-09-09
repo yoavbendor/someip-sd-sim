@@ -41,6 +41,9 @@ jobs:
         # below is the networked part.
         run: uv run python scripts/offline_roundtrip_check.py
 
+      - name: Offline --exit-after-subscribed check (no networking)
+        run: uv run python scripts/exit_after_subscribed_check.py
+
       - name: Diagnose raw cross-process IPv6 multicast on this runner
         # Informational only (does not fail the build): GitHub-hosted
         # runners were found NOT to deliver IPv6 multicast on `lo` between
@@ -134,6 +137,59 @@ jobs:
 
           exit $fail
 
+      - name: Live check -- --exit-after-subscribed exits 0 without a StopOffer
+        # Separate short-lived server/client pair (same --peer-addr unicast
+        # SD fallback as the main run above, for the same no-multicast-on-lo
+        # reason). Confirms the real, live behavior that scripts/
+        # exit_after_subscribed_check.py can't: the server actually reaches
+        # exit code 0 once subscribed, and does so WITHOUT the client ever
+        # seeing a StopOffer -- which is the entire point of the feature
+        # (leaving the client's SD state/multicast membership untouched for
+        # a later tcpreplay of the real captured data).
+        run: |
+          timeout 30 uv run sd-server --peer-addr ::1 --exit-after-subscribed \
+            --subscribe-timeout 20 --log-level DEBUG > server-eas.log 2>&1 &
+          SERVER_PID=$!
+          sleep 1
+          uv run sd-client --peer-addr ::1 --log-level DEBUG > client-eas.log 2>&1 &
+          CLIENT_PID=$!
+
+          set +e
+          wait "$SERVER_PID"
+          SERVER_STATUS=$?
+          set -e
+
+          kill -INT "$CLIENT_PID" 2>/dev/null || true
+          sleep 1
+          kill -9 "$CLIENT_PID" 2>/dev/null || true
+
+          echo "=== server-eas.log ==="; cat server-eas.log
+          echo
+          echo "=== client-eas.log ==="; cat client-eas.log
+          echo
+
+          fail=0
+          if [ "$SERVER_STATUS" != "0" ]; then
+            echo "::error::server --exit-after-subscribed exited with status $SERVER_STATUS (expected 0)"
+            fail=1
+          else
+            echo "OK: server exited 0"
+          fi
+          if ! grep -q "exiting 0 for tcpreplay handoff" server-eas.log; then
+            echo "::error file=server-eas.log::server did not log taking the exit-after-subscribed path"
+            fail=1
+          else
+            echo "OK: server took the exit-after-subscribed path"
+          fi
+          if grep -q "shutting down: sending StopOffer" server-eas.log; then
+            echo "::error file=server-eas.log::server logged the normal StopOffer shutdown path -- exit-after-subscribed must skip it"
+            fail=1
+          else
+            echo "OK: server did not take the normal StopOffer shutdown path"
+          fi
+
+          exit $fail
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -142,6 +198,8 @@ jobs:
           path: |
             server.log
             client.log
+            server-eas.log
+            client-eas.log
             recv.log
             send.log
 
